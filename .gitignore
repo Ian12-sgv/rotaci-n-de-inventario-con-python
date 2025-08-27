@@ -1,0 +1,33 @@
+# Ignorar entorno virtual
+.venv/
+
+# Ignorar carpetas de compilación o distribución
+build/
+dist/
+
+# Ignorar archivos compilados de Python
+__pycache__/
+*.py[cod]
+
+# Ignorar archivos temporales y de sistema operativo
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+
+# Ignorar carpetas específicas de IDE/editor (si usas VSCode, PyCharm, etc.)
+.vscode/
+.idea/
+
+# Ignorar archivos específicos que pueden ser binarios o grandes
+*.exe
+*.pkg
+
+# Opcional: Ignorar archivos de caché específicos de Python (puedes agregar más)
+*.pyo
+*.pyd
+
+# Ignorar otros archivos temporales (ajusta según necesidad)
+*.bak
+*.orig
