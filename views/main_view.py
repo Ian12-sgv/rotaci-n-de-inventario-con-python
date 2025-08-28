@@ -2,15 +2,7 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import ttk, messagebox
 import pandas as pd
-
-# Nota: ahora importamos get_cruce_data_df (server-side)
-from db.connection import (
-    get_db_connection,
-    get_cruce_data_df,
-    set_default_instance,
-    PREDEFINED_INSTANCES,
-)
-from utils.helpers import export_to_excel, export_to_csv, get_save_path
+from db.connection import get_db_connection, get_cruce_data, set_default_instance, PREDEFINED_INSTANCES
 
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
@@ -19,8 +11,7 @@ desired_cols = [
     "CodigoBarra", "Referencia", "CodigoMarca", "Marca", "Nombre",
     "Nombre_Fabricante", "CodigoFabricante", "CategoriaCodigo", "CategoriaNombre",
     "Linea", "CantidadInicial", "Cantidad_Inicial_Agrupada", "ExistenciaActual",
-    "correccion", "NumeroTransferencia", "FechaLlegada", "observacion",
-    "CodigoRecibe", "Queda", "Vendido"
+    "correccion", "NumeroTransferencia", "FechaLlegada", "observacion", "Queda", "Vendido"
 ]
 
 class MainView(ctk.CTk):
@@ -30,13 +21,8 @@ class MainView(ctk.CTk):
         self.title("Previsualización de Consulta Cruzada")
         self.geometry("900x600")
         self.refresh_callback = refresh_callback
+        self.df_cruce = None
 
-        # Estado
-        self.engine = None
-        self.df_full = None    # dataset completo importado según rango
-        self.df_view = None    # dataset actualmente mostrado (filtrado)
-
-        # Layout
         self.grid_rowconfigure(0, weight=0)
         self.grid_rowconfigure(1, weight=0)
         self.grid_rowconfigure(2, weight=1)
@@ -52,12 +38,60 @@ class MainView(ctk.CTk):
 
         self.filter_frame = None
 
+    # ---------------------------- helpers ---------------------------------
+
+    def _recalc_visible_totals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Recalcula:
+        - Cantidad_Inicial_Agrupada = suma de CantidadInicial por CodigoBarra SOLO con las filas visibles (df).
+        - Queda, Vendido = porcentajes usando ese nuevo denominador visible.
+        No modifica tus filtros; solo ajusta columnas calculadas para lo que se muestra.
+        """
+        if df.empty:
+            return df
+
+        # Asegurar tipos numéricos (evita problemas con strings)
+        if "CantidadInicial" in df.columns:
+            df["CantidadInicial"] = pd.to_numeric(df["CantidadInicial"], errors="coerce").fillna(0)
+        else:
+            df["CantidadInicial"] = 0
+
+        if "ExistenciaActual" in df.columns:
+            df["ExistenciaActual"] = pd.to_numeric(df["ExistenciaActual"], errors="coerce").fillna(0)
+        else:
+            df["ExistenciaActual"] = 0
+
+        # Suma visible por CodigoBarra
+        if "CodigoBarra" in df.columns:
+            tot_visible = df.groupby("CodigoBarra")["CantidadInicial"].transform("sum")
+        else:
+            # Si no existiera (no debería), usa suma global
+            tot_visible = pd.Series(df["CantidadInicial"].sum(), index=df.index)
+
+        # Actualiza la columna con el total visible
+        df["Cantidad_Inicial_Agrupada"] = tot_visible
+
+        # Recalcular Queda/Vendido con ese denominador visible
+        denom = tot_visible.replace(0, pd.NA)
+        queda_num = ((df["ExistenciaActual"] * 100) / denom).astype("float")
+        queda_num = queda_num.fillna(0).round(2)
+        vendido_num = (100 - queda_num).round(2)
+
+        # Formato con coma y %
+        df["Queda"] = queda_num.map(lambda x: f"{x:.2f}%".replace(".", ","))
+        df["Vendido"] = vendido_num.map(lambda x: f"{x:.2f}%".replace(".", ","))
+
+        return df
+
+    # ---------------------------- UI --------------------------------------
+
     def _build_button_bar(self):
         self.button_frame = ctk.CTkFrame(self)
         self.button_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
         self.button_frame.grid_columnconfigure(0, weight=0)
         self.button_frame.grid_columnconfigure(1, weight=1)
 
+        # Cargar solo las instancias predefinidas
         predefinidas = list(PREDEFINED_INSTANCES.keys())
         self.instancia_var = tk.StringVar(value=predefinidas[0])
 
@@ -69,138 +103,69 @@ class MainView(ctk.CTk):
         )
         self.instancia_combo.grid(row=0, column=0, sticky="w", padx=5)
 
-        # Selecciona instancia inicial y crea engine
+        # Forzar selección al iniciar
         self.on_instance_selected(self.instancia_var.get())
 
+        # Botón «Importar Datos»
         self.import_btn = ctk.CTkButton(
             self.button_frame, text="Importar Datos", command=self.import_cruce
         )
         self.import_btn.grid(row=0, column=1, sticky="w", padx=5)
 
-        self.export_btn = ctk.CTkButton(
-            self.button_frame, text="Exportar Datos", command=self.export_data
-        )
-        self.export_btn.grid(row=0, column=3, sticky="w", padx=5)
-
+        # Selector de rango de fechas
         self.fecha_option = tk.IntVar(value=2)
         self.fecha_frame = ctk.CTkFrame(self.button_frame)
         self.fecha_frame.grid(row=0, column=2, sticky="e", padx=20)
 
         ctk.CTkLabel(self.fecha_frame, text="Filtro por fecha:").pack(anchor="w")
         ctk.CTkRadioButton(
-            self.fecha_frame, text="2023/01/01 - Actual",
-            variable=self.fecha_option, value=1,
-            command=self.on_fecha_changed
+            self.fecha_frame, text="2023/01/01 - Actual", variable=self.fecha_option, value=1
         ).pack(anchor="w")
         ctk.CTkRadioButton(
-            self.fecha_frame, text="2024/01/01 - Actual",
-            variable=self.fecha_option, value=2,
-            command=self.on_fecha_changed
+            self.fecha_frame, text="2024/01/01 - Actual", variable=self.fecha_option, value=2
         ).pack(anchor="w")
 
     def on_instance_selected(self, selected):
         try:
             set_default_instance(selected)
-            self.engine = get_db_connection()
             print(f"Instancia seleccionada: {selected}")
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo seleccionar la instancia:\n{e}")
-
-    def on_fecha_changed(self):
-        """Reimporta automáticamente al cambiar el rango."""
-        self.import_cruce()
 
     def _build_treeview(self, parent):
         container = tk.Frame(parent)
         container.pack(expand=True, fill="both")
 
         self.tree_cruce = ttk.Treeview(container, columns=desired_cols, show="headings")
-
         for col in desired_cols:
             self.tree_cruce.heading(col, text=col)
-            self.tree_cruce.column(col, width=120, anchor="center", stretch=False)
+            self.tree_cruce.column(col, width=120, anchor="center", stretch=True)
 
         self.tree_cruce.grid(row=0, column=0, sticky="nsew")
-
         container.grid_rowconfigure(0, weight=1)
         container.grid_columnconfigure(0, weight=1)
 
         vsb = ttk.Scrollbar(container, orient="vertical", command=self.tree_cruce.yview)
-        vsb.grid(row=0, column=1, sticky="ns")
         hsb = ttk.Scrollbar(container, orient="horizontal", command=self.tree_cruce.xview)
+        self.tree_cruce.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
 
-        self.tree_cruce.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        container.bind("<Configure>", self._auto_resize_columns)
         self.tree_cruce.bind("<Button-3>", self.show_context_menu)
 
-    def import_cruce(self):
-        try:
-            if not self.engine:
-                self.engine = get_db_connection()
-            if not self.engine:
-                raise RuntimeError("No hay conexión a base de datos.")
-
-            # Server-side import según rango seleccionado
-            df = get_cruce_data_df(
-                self.engine,
-                fecha_option=self.fecha_option.get()
-            )
-
-            if df.empty:
-                self.df_full = pd.DataFrame(columns=desired_cols)
-                self.df_view = self.df_full.copy()
-            else:
-                # Asegura columnas esperadas
-                faltan = [c for c in desired_cols if c not in df.columns]
-                if faltan:
-                    raise ValueError(f"Faltan columnas en el resultado SQL: {faltan}")
-
-                self.df_full = df[desired_cols].copy()
-                self.df_view = self.df_full.copy()
-
-            self.populate_tree(self.df_view.values.tolist())
-            messagebox.showinfo("Importación", "Datos importados correctamente.")
-
-            if not self.filter_frame:
-                self.create_filter_frame()
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Fallo en la importación: {e}")
-
-    def export_data(self):
-        df_base = self.df_view if self.df_view is not None else self.df_full
-        if df_base is None or df_base.empty:
-            messagebox.showwarning("Atención", "No hay datos para exportar.")
-            return
-
-        file_path = get_save_path(self)
-        if not file_path:
-            return  # Usuario canceló
-
-        try:
-            columnas_texto = ["CodigoFabricante", "CategoriaCodigo", "CodigoBarra"]
-            df_to_export = df_base.copy()
-
-            for col in columnas_texto:
-                if col in df_to_export.columns:
-                    df_to_export[col] = df_to_export[col].astype(str).str.strip()
-
-            if file_path.lower().endswith(".csv"):
-                export_to_csv(df_to_export.to_dict(orient="records"), file_path)
-            else:
-                export_to_excel(df_to_export.to_dict(orient="records"), file_path)
-
-            messagebox.showinfo("Éxito", f"Datos exportados correctamente:\n{file_path}")
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Fallo al exportar:\n{e}")
+    def _auto_resize_columns(self, event):
+        total = event.width
+        col_w = max(90, int(total / len(desired_cols)))
+        for col in desired_cols:
+            self.tree_cruce.column(col, width=col_w)
 
     def create_filter_frame(self):
         self.label_font = ctk.CTkFont(size=11)
         self.filter_frame = ctk.CTkFrame(self)
         self.filter_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
 
-        for c in range(0, 8, 2):
+        for c in range(0, 6, 2):
             self.filter_frame.grid_columnconfigure(c, weight=0)
             self.filter_frame.grid_columnconfigure(c + 1, weight=1, uniform="entry")
 
@@ -214,84 +179,84 @@ class MainView(ctk.CTk):
         self.codigo_barra_entry = _pair(0, 0, "Código Barra:")
         self.referencia_entry   = _pair(0, 2, "Referencia:")
         self.categoria_entry    = _pair(0, 4, "Categoría:")
-        self.codigo_recibe_entry = _pair(0, 6, "Excluir CódigoRecibe(s):")
 
         self.linea_entry        = _pair(1, 0, "Línea:")
         self.fabrica_entry      = _pair(1, 2, "Código de Fábrica:")
 
-        # Botones
-        self.buscar_btn = ctk.CTkButton(self.filter_frame, text="Buscar", command=self.buscar_datos)
-        self.buscar_btn.grid(row=2, column=6, columnspan=2, pady=(8, 0), sticky="e")
+        # ✅ NUEVO: checkbox "Solo corrección = 0"
+        self.correccion_cero_var = tk.IntVar(value=0)
+        self.correccion_cero_chk = ctk.CTkCheckBox(
+            self.filter_frame,
+            text="Solo corrección = 0",
+            variable=self.correccion_cero_var
+        )
+        self.correccion_cero_chk.grid(row=1, column=4, columnspan=2, padx=(2, 10), pady=2, sticky="w")
 
-        self.limpiar_btn = ctk.CTkButton(self.filter_frame, text="Limpiar", command=self.limpiar_filtros)
-        self.limpiar_btn.grid(row=2, column=4, columnspan=2, pady=(8, 0), sticky="w")
+        self.buscar_btn = ctk.CTkButton(
+            self.filter_frame, text="Buscar", command=self.buscar_datos
+        )
+        self.buscar_btn.grid(row=2, column=0, columnspan=6, pady=(8, 0), sticky="e")
 
-        # Enter dispara búsqueda
-        for w in (
-            self.codigo_barra_entry, self.referencia_entry, self.categoria_entry,
-            self.codigo_recibe_entry, self.linea_entry, self.fabrica_entry
-        ):
-            w.bind("<Return>", lambda _e: self.buscar_datos())
+    # ---------------------------- data flow --------------------------------
+
+    def import_cruce(self):
+        try:
+            engine = get_db_connection()
+            data = get_cruce_data(engine, fecha_option=self.fecha_option.get())
+            df = pd.DataFrame(data) if data else pd.DataFrame()
+
+            # Recalcular totales para el conjunto visible actual (todo el dataset)
+            df = self._recalc_visible_totals(df.copy())
+
+            # Mantener solo las columnas deseadas
+            self.df_cruce = df[desired_cols].copy() if not df.empty else df
+            self.populate_tree(self.df_cruce.values.tolist())
+
+            messagebox.showinfo("Importación", "Datos importados correctamente.")
+
+            if not self.filter_frame:
+                self.create_filter_frame()
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Fallo en la importación: {e}")
 
     def buscar_datos(self):
-        if self.engine is None:
-            messagebox.showwarning("Atención", "Primero seleccione instancia e importe datos.")
+        if self.df_cruce is None:
+            messagebox.showwarning("Atención", "Primero importe los datos.")
             return
 
-        # Lee filtros de la UI (sin lower: el backend normaliza Referencia)
-        codigo_barra = self.codigo_barra_entry.get().strip()
-        referencia   = self.referencia_entry.get().strip()
-        categoria    = self.categoria_entry.get().strip()
-        linea        = self.linea_entry.get().strip()
-        fabrica      = self.fabrica_entry.get().strip()
-        excluir_raw  = self.codigo_recibe_entry.get().strip()
+        df = self.df_cruce.copy()
+        filtros = {
+            "CodigoBarra": self.codigo_barra_entry.get().strip(),
+            "Referencia": self.referencia_entry.get().strip().lower(),
+            "CategoriaNombre": self.categoria_entry.get().strip().lower(),
+            "Linea": self.linea_entry.get().strip().lower(),
+            "CodigoFabricante": self.fabrica_entry.get().strip(),
+            "CorreccionCero": bool(self.correccion_cero_var.get()),
+        }
 
-        try:
-            # Consulta al servidor con filtros + rango
-            df = get_cruce_data_df(
-                self.engine,
-                codigo_filter=codigo_barra or None,
-                referencia_filter=referencia or None,
-                categoria_filter=categoria or None,
-                linea_filter=linea or None,
-                fabrica_filter=fabrica or None,
-                fecha_option=self.fecha_option.get()
-            )
+        if "CodigoBarra" in df.columns and filtros["CodigoBarra"]:
+            df = df[df["CodigoBarra"].astype(str) == filtros["CodigoBarra"]]
+        if "Referencia" in df.columns and filtros["Referencia"]:
+            df = df[df["Referencia"].astype(str).str.strip().str.lower() == filtros["Referencia"]]
+        if "CategoriaNombre" in df.columns and filtros["CategoriaNombre"]:
+            df = df[df["CategoriaNombre"].astype(str).str.strip().str.lower() == filtros["CategoriaNombre"]]
+        if "Linea" in df.columns and filtros["Linea"]:
+            df = df[df["Linea"].astype(str).str.strip().str.lower() == filtros["Linea"]]
+        if "CodigoFabricante" in df.columns and filtros["CodigoFabricante"]:
+            df = df[df["CodigoFabricante"].astype(str).str.strip() == filtros["CodigoFabricante"]]
 
-            df = df[desired_cols].copy() if not df.empty else df
+        if filtros["CorreccionCero"] and "correccion" in df.columns:
+            mask = pd.to_numeric(df["correccion"], errors="coerce") == 0
+            df = df[mask]
 
-            # Exclusión de CodigoRecibe en cliente
-            if excluir_raw and not df.empty:
-                if "CodigoRecibe" in df.columns:
-                    codigos_excluir = [c.strip().upper() for c in excluir_raw.split(",") if c.strip()]
-                    temp = df.assign(CodigoRecibe=df["CodigoRecibe"].astype(str).str.strip())
-                    df = temp[~temp["CodigoRecibe"].str.upper().isin(codigos_excluir)].copy()
-                else:
-                    messagebox.showwarning("Atención", "La columna 'CodigoRecibe' no está en los datos.")
+        # 🔁 Recalcular totales (agrupada/porcentajes) con SOLO estas filas visibles
+        df = self._recalc_visible_totals(df.copy())
 
-            self.df_view = df
-            self.populate_tree(self.df_view.values.tolist())
+        # Mantener columnas en el orden esperado
+        df = df.reindex(columns=desired_cols)
 
-        except Exception as e:
-            messagebox.showerror("Error", f"Fallo al aplicar filtros: {e}")
-
-    def limpiar_filtros(self):
-        for w in (
-            self.codigo_barra_entry, self.referencia_entry, self.categoria_entry,
-            self.codigo_recibe_entry, self.linea_entry, self.fabrica_entry
-        ):
-            w.delete(0, tk.END)
-
-        # Reconsulta sin filtros (pero respeta el rango seleccionado)
-        try:
-            df = get_cruce_data_df(self.engine, fecha_option=self.fecha_option.get())
-            if df.empty:
-                self.df_view = pd.DataFrame(columns=desired_cols)
-            else:
-                self.df_view = df[desired_cols].copy()
-            self.populate_tree(self.df_view.values.tolist())
-        except Exception as e:
-            messagebox.showerror("Error", f"No se pudieron limpiar filtros: {e}")
+        self.populate_tree(df.values.tolist())
 
     def populate_tree(self, rows):
         self.tree_cruce.delete(*self.tree_cruce.get_children())
@@ -322,10 +287,9 @@ class MainView(ctk.CTk):
         self.clipboard_clear()
         self.clipboard_append(text)
 
-
+# -------------------------------------------------------------------------
 def dummy_refresh_function():
     return None
-
 
 if __name__ == "__main__":
     app = MainView(refresh_callback=dummy_refresh_function)
